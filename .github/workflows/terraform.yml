@@ -83,7 +83,8 @@ jobs:
           echo "git checkout"
           git checkout aws/destroy/main
           echo "git merge"
-          git merge origin/aws/destroy/main
+          git merge --allow-unrelated-histories origin/aws/destroy/main          
+          # git merge origin/aws/destroy/main
           mv main.tf.origin main.tf
           if [ -f terraform.tfstate ]; then
             mv terraform.tfstate state/

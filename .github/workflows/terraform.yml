@@ -55,10 +55,7 @@ jobs:
           terraform validate
           terraform plan
           echo "Checking existing resources..."
-          LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
-          echo $LAMBDA_ROLE_NAME
-          echo "Test: ${LAMBDA_ROLE_NAME}"
-          if aws iam get-role --role-name $LAMBDA_ROLE_NAME >/dev/null 2>&1; then
+          if aws iam get-role --role-name learn-tf-aws-vpc-ssm-role >/dev/null 2>&1; then
               echo "Role exists - will use existing"
               terraform apply --auto-approve -var="use_existing_iam=true"
           else
@@ -86,8 +83,7 @@ jobs:
           echo "git checkout"
           git checkout aws/destroy/main
           echo "git merge"
-          git merge --allow-unrelated-histories origin/aws/destroy/main          
-          # git merge origin/aws/destroy/main
+          git merge origin/aws/destroy/main
           mv main.tf.origin main.tf
           if [ -f terraform.tfstate ]; then
             mv terraform.tfstate state/
@@ -102,47 +98,33 @@ jobs:
       - name: Terraform Destroy on Failure
         if: failure()
         run: |
-          terraform destroy -auto-approve -input=false
-          echo "Check if learn-tf-aws-vpc-ssm-role exists"
-          ROLE_NAME="learn-tf-aws-vpc-ssm-role"
-          LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
-          INSTANCE_PROFILE_NAME="learn-tf-aws-vpc-ssm-profile"          
-          if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep $ROLE_NAME | sed 's/[",]//g')" ]; then
-              
-              echo "Removing role from instance profile first..."
-              # Remove role from instance profile
-              aws iam remove-role-from-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" --role-name "$ROLE_NAME" 2>/dev/null || echo "Role not in instance profile or doesn't exist"
-              
-              echo "Deleting instance profile: $INSTANCE_PROFILE_NAME"
-              aws iam delete-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" 2>/dev/null || echo "Instance profile doesn't exist"
-              
-              echo "Detaching managed policies from role: $ROLE_NAME"
-              # Detach AWS managed policies
-              aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" 2>/dev/null || echo "Policy already detached or doesn't exist"
-              
-              echo "Detaching inline policies from role: $ROLE_NAME"
-              # List and delete inline policies
+          ROLE_NAME="learn-api-gateway-lambda-role"
+
+          echo "Checking if $ROLE_NAME exists..."
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+              echo "Role found. Detaching all managed policies..."
+              # Detach all managed policies (handles any number dynamically)
+              POLICIES=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text)
+              for POLICY_ARN in $POLICIES; do
+                  if [ "$POLICY_ARN" != "None" ] && [ -n "$POLICY_ARN" ]; then
+                      echo "Detaching: $POLICY_ARN"
+                      aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
+                  fi
+              done
+
+              echo "Deleting inline policies..."
               INLINE_POLICIES=$(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text)
               for POLICY in $INLINE_POLICIES; do
                   if [ "$POLICY" != "None" ] && [ -n "$POLICY" ]; then
+                      echo "Deleting inline policy: $POLICY"
                       aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY"
-                      echo "Deleted inline policy: $POLICY"
                   fi
               done
-              
+
               echo "Deleting role: $ROLE_NAME"
               aws iam delete-role --role-name "$ROLE_NAME"
               echo "Role deleted successfully"
           else
               echo "Role $ROLE_NAME does not exist"
-          fi
-          if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep $LAMBDA_ROLE_NAME | sed 's/[",]//g')" ]; then
-              echo "Deleting role: $LAMBDA_ROLE_NAME"
-              aws iam delete-role --role-name "$LAMBDA_ROLE_NAME"
-              echo "Role deleted successfully"
-          fi
-          echo "Check if learn-tf-aws-vpc-ssm-profile exist"
-          if [ -n "$(aws iam list-instance-profiles --query InstanceProfiles[*].InstanceProfileName | grep learn-tf-aws-vpc-ssm-profile | sed 's/[",]//g')" ]; then
-            aws iam delete-instance-profile --instance-profile-name $(aws iam list-instance-profiles --query InstanceProfiles[*].InstanceProfileName | grep learn-tf-aws-vpc-ssm-profile | sed 's/[",]//g')
           fi
         working-directory: infra_terraform

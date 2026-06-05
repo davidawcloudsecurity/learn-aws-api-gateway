@@ -55,7 +55,8 @@ jobs:
           terraform validate
           terraform plan
           echo "Checking existing resources..."
-          if aws iam get-role --role-name learn-tf-aws-vpc-ssm-role >/dev/null 2>&1; then
+          LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
+          if aws iam get-role --role-name $LAMBDA_ROLE_NAME >/dev/null 2>&1; then
               echo "Role exists - will use existing"
               terraform apply --auto-approve -var="use_existing_iam=true"
           else

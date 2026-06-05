@@ -1,91 +1,87 @@
-# AWS Patch Manager + ASG + Managed AD (Windows)
+# AWS API Gateway + Lambda (Terraform)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  VPC (172.16.0.0/16)                                            │
-│                                                                 │
-│  ┌─────────────────────┐    ┌─────────────────────┐            │
-│  │ Public Subnet AZ-a  │    │ Public Subnet AZ-b  │            │
-│  │   NAT Gateway       │    │                     │            │
-│  └─────────────────────┘    └─────────────────────┘            │
-│                                                                 │
-│  ┌─────────────────────┐    ┌─────────────────────┐            │
-│  │ Private Subnet AZ-a │    │ Private Subnet AZ-b │            │
-│  │                     │    │                     │            │
-│  │  ┌───────────────┐  │    │  ┌───────────────┐  │            │
-│  │  │ Managed AD DC │  │    │  │ Managed AD DC │  │            │
-│  │  └───────────────┘  │    │  └───────────────┘  │            │
-│  │                     │    │                     │            │
-│  │  ┌───────────────┐  │    │  ┌───────────────┐  │            │
-│  │  │ Win ASG Inst. │  │    │  │ Win ASG Inst. │  │            │
-│  │  │ (AD-Joined)   │  │    │  │ (AD-Joined)   │  │            │
-│  │  └───────────────┘  │    │  └───────────────┘  │            │
-│  └─────────────────────┘    └─────────────────────┘            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-SSM Patch Manager ──► Maintenance Window ──► AWS-RunPatchBaseline
-                          (Sunday 2AM UTC)
-                               │
-                               ▼
-                    Targets: tag:PatchGroup = "Windows-Production"
+Client
+  │
+  ▼ POST /pricePerMeter
+┌─────────────────────────────────┐
+│  API Gateway (REST, Regional)   │
+│  API: calculatePrice            │
+│  Resource: /pricePerMeter       │
+│  Method: POST (Lambda Proxy)    │
+└─────────────────┬───────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────┐
+│  Lambda: CalculateCostPerUnit   │
+│  Runtime: Python 3.12           │
+│  Returns: pricePerUnit,         │
+│           totalCost,            │
+│           downPaymentAmount     │
+└─────────────────────────────────┘
 ```
 
-## How It Works
+## What It Does
 
-1. **AWS Managed Microsoft AD** is deployed across 2 AZs in private subnets
-2. **DHCP Options** point VPC DNS to the AD domain controllers
-3. **Launch Template** tags instances with `ADJoin=true`
-4. **SSM Association** watches for `ADJoin=true` tag and runs `aws:domainJoin`
-5. **ASG** launches Windows instances in private subnets → they auto-join AD
-6. **Patch Manager** runs `AWS-RunPatchBaseline` every Sunday at 2 AM via maintenance window
+- REST API with a `POST /pricePerMeter` endpoint
+- Lambda calculates price per unit and total cost after down payment
+- Sample request:
 
-## Prerequisites
+```json
+{
+  "price": "400000",
+  "size": "1600",
+  "unit": "sqFt",
+  "downPayment": "20"
+}
+```
 
-- Terraform >= 1.0
-- AWS CLI configured with appropriate permissions
-- Permissions needed:
-  - `ds:*` (Directory Service)
-  - `ec2:*` (VPC, ASG, Launch Templates)
-  - `ssm:*` (Systems Manager)
-  - `iam:*` (Roles, Profiles)
+- Sample response:
+
+```json
+{
+  "pricePerUnit": 250.0,
+  "unit": "sqFt",
+  "totalPrice": 400000.0,
+  "downPaymentPercent": 20.0,
+  "downPaymentAmount": 80000.0,
+  "totalCost": 320000.0
+}
+```
 
 ## Usage
 
 ```bash
-# Set the AD admin password (never commit this)
-export TF_VAR_ad_admin_password='YourStr0ngP@ssword!'
-
-# Initialize and apply
 terraform init
 terraform plan
 terraform apply
 ```
 
-## Important Notes
+After apply, test with curl:
 
-- **Managed AD takes ~30 minutes to provision**
-- AD admin password must be set via environment variable or a secrets file
-- Instances are in private subnets — use SSM Session Manager for access (no RDP over internet)
-- NAT Gateway provides outbound internet for patching
-- The patch baseline auto-approves Critical/Security updates after 7 days
+```bash
+curl -X POST \
+  "$(terraform output -raw api_gateway_url)" \
+  -H "Content-Type: application/json" \
+  -d '{"price":"400000","size":"1600","unit":"sqFt","downPayment":"20"}'
+```
 
-## Cost Considerations
+## Files
 
-| Resource | Approximate Cost |
-|----------|-----------------|
-| Managed AD (Standard) | ~$72/month |
+| File | Purpose |
+|------|---------|
+| `main.tf` | VPC networking + Lambda + API Gateway |
+| `variables.tf` | Input variables |
+| `terraform.tfvars` | Variable values |
+| `lambda/calculate_cost.py` | Lambda function source |
+
+## Cost
+
+| Resource | Cost |
+|----------|------|
+| API Gateway | Free tier: 1M calls/month |
+| Lambda | Free tier: 1M requests/month |
 | NAT Gateway | ~$32/month + data |
-| t3.medium (per instance) | ~$30/month |
-| SSM Patch Manager | Free |
-
-## Patching Strategy
-
-This uses **mutable in-place patching** — instances are patched while running.
-For immutable patching (golden AMI refresh), you would:
-1. Patch a source AMI using SSM Automation
-2. Update the Launch Template AMI ID
-3. Trigger an ASG instance refresh
-
+| VPC | Free |

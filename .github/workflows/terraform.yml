@@ -136,6 +136,21 @@ jobs:
               echo "Role $ROLE_NAME does not exist"
           fi
           if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep $LAMBDA_ROLE_NAME | sed 's/[",]//g')" ]; then
+              echo "Detaching all managed policies from: $LAMBDA_ROLE_NAME"
+              POLICIES=$(aws iam list-attached-role-policies --role-name "$LAMBDA_ROLE_NAME" --query 'AttachedPolicies[*].PolicyArn' --output text)
+              for POLICY_ARN in $POLICIES; do
+                  if [ "$POLICY_ARN" != "None" ] && [ -n "$POLICY_ARN" ]; then
+                      echo "Detaching: $POLICY_ARN"
+                      aws iam detach-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-arn "$POLICY_ARN"
+                  fi
+              done
+              echo "Deleting inline policies from: $LAMBDA_ROLE_NAME"
+              INLINE_POLICIES=$(aws iam list-role-policies --role-name "$LAMBDA_ROLE_NAME" --query 'PolicyNames' --output text)
+              for POLICY in $INLINE_POLICIES; do
+                  if [ "$POLICY" != "None" ] && [ -n "$POLICY" ]; then
+                      aws iam delete-role-policy --role-name "$LAMBDA_ROLE_NAME" --policy-name "$POLICY"
+                  fi
+              done
               echo "Deleting role: $LAMBDA_ROLE_NAME"
               aws iam delete-role --role-name "$LAMBDA_ROLE_NAME"
               echo "Role deleted successfully"

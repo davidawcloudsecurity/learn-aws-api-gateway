@@ -1,0 +1,856 @@
+provider "aws" {
+  region = var.region
+}
+
+# ============================================================
+# VPC + Networking (2 AZs required for Managed AD)
+# ============================================================
+
+resource "aws_vpc" "main" {
+  count                = var.create_vpc ? 1 : 0
+  cidr_block           = var.main_cidr_block
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags = { Name = var.project_tag }
+}
+
+locals {
+  vpc_id       = var.create_vpc ? aws_vpc.main[0].id : data.aws_vpc.existing[0].id
+  ami_id       = var.custom_ami_id != "" ? var.custom_ami_id : data.aws_ami.windows_2019[0].id
+  linux_ami_id = var.custom_linux_ami_id != "" ? var.custom_linux_ami_id : data.aws_ami.ubuntu_2204.id
+}
+
+data "aws_vpc" "existing" {
+  count = var.create_vpc ? 0 : 1
+  filter {
+    name   = "tag:Name"
+    values = [var.project_tag]
+  }
+}
+
+resource "aws_internet_gateway" "igw" {
+  count  = var.create_vpc ? 1 : 0
+  vpc_id = local.vpc_id
+  tags   = { Name = "${var.project_tag}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  count                   = var.create_vpc ? length(var.public_subnet_cidrs) : 0
+  vpc_id                  = local.vpc_id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.project_tag}-public-${var.azs[count.index]}" }
+}
+
+resource "aws_subnet" "private" {
+  count             = var.create_vpc ? length(var.private_subnet_cidrs) : 0
+  vpc_id            = local.vpc_id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.azs[count.index]
+  tags = { Name = "${var.project_tag}-private-${var.azs[count.index]}" }
+}
+
+# NAT Gateway — ASG instances in private subnets need outbound for patching
+resource "aws_eip" "nat" {
+  count  = var.create_vpc ? 1 : 0
+  domain = "vpc"
+  tags   = { Name = "${var.project_tag}-nat-eip" }
+}
+
+resource "aws_nat_gateway" "nat" {
+  count         = var.create_vpc ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "${var.project_tag}-nat-gw", "auto-delete" = "no" }
+  depends_on    = [aws_internet_gateway.igw]
+}
+
+resource "aws_route_table" "public" {
+  count  = var.create_vpc ? 1 : 0
+  vpc_id = local.vpc_id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw[0].id
+  }
+  tags = { Name = "${var.project_tag}-public-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = var.create_vpc ? length(aws_subnet.public) : 0
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public[0].id
+}
+
+resource "aws_route_table" "private" {
+  count  = var.create_vpc ? 1 : 0
+  vpc_id = local.vpc_id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat[0].id
+  }
+  tags = { Name = "${var.project_tag}-private-rt" }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = var.create_vpc ? length(aws_subnet.private) : 0
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[0].id
+}
+
+# ============================================================
+# AWS Managed Microsoft AD
+# ============================================================
+
+resource "aws_directory_service_directory" "managed_ad" {
+  name     = var.ad_domain_name
+  password = var.ad_admin_password
+  edition  = var.ad_edition
+  type     = "MicrosoftAD"
+
+  vpc_settings {
+    vpc_id     = local.vpc_id
+    subnet_ids = aws_subnet.private[*].id
+  }
+
+  tags = { Name = "${var.project_tag}-managed-ad", "auto-delete" = "no" }
+}
+
+# Point VPC DNS to Managed AD domain controllers
+resource "aws_vpc_dhcp_options" "ad_dns" {
+  domain_name         = var.ad_domain_name
+  domain_name_servers = aws_directory_service_directory.managed_ad.dns_ip_addresses
+  tags                = { Name = "${var.project_tag}-ad-dhcp" }
+}
+
+resource "aws_vpc_dhcp_options_association" "ad_dns" {
+  vpc_id          = local.vpc_id
+  dhcp_options_id = aws_vpc_dhcp_options.ad_dns.id
+}
+
+# ============================================================
+# IAM Role — EC2 instances need SSM + Directory Service access
+# ============================================================
+
+resource "aws_iam_role" "ec2_ssm_ad" {
+  name = "${var.project_tag}-ec2-ssm-ad-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+
+  tags = { Name = "${var.project_tag}-ec2-ssm-ad-role" }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ec2_ssm_ad.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_directory" {
+  role       = aws_iam_role.ec2_ssm_ad.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess"
+}
+
+resource "aws_iam_instance_profile" "ec2_ssm_ad" {
+  name = "${var.project_tag}-ec2-ssm-ad-profile"
+  role = aws_iam_role.ec2_ssm_ad.name
+}
+
+# ============================================================
+# SSM Document + Association — Auto AD Domain Join
+# ============================================================
+
+resource "aws_ssm_document" "ad_join" {
+  name          = "${var.project_tag}-ad-domain-join"
+  document_type = "Command"
+
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "Join Windows instance to AWS Managed AD"
+    mainSteps = [{
+      action = "aws:domainJoin"
+      name   = "domainJoin"
+      inputs = {
+        directoryId    = aws_directory_service_directory.managed_ad.id
+        directoryName  = var.ad_domain_name
+        dnsIpAddresses = aws_directory_service_directory.managed_ad.dns_ip_addresses
+      }
+    }]
+  })
+
+  tags = { Name = "${var.project_tag}-ad-join-doc" }
+}
+
+# Any instance tagged ADJoin=true will auto-join the domain
+resource "aws_ssm_association" "ad_join" {
+  name = aws_ssm_document.ad_join.name
+
+  targets {
+    key    = "tag:ADJoin"
+    values = ["true"]
+  }
+
+  depends_on = [aws_directory_service_directory.managed_ad]
+}
+
+# ============================================================
+# Security Group — Windows ASG (AD + SSM + Patching)
+# ============================================================
+
+resource "aws_security_group" "windows_asg" {
+  name        = "${var.project_tag}-windows-asg-sg"
+  description = "Windows ASG instances: AD-joined, SSM patching"
+  vpc_id      = local.vpc_id
+
+  # RDP from within VPC only
+  ingress {
+    from_port   = 3389
+    to_port     = 3389
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "RDP from VPC"
+  }
+
+  # WinRM for SSM
+  ingress {
+    from_port   = 5985
+    to_port     = 5986
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "WinRM"
+  }
+
+  # AD protocols (DNS, Kerberos, LDAP, SMB, LDAPS)
+  ingress {
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "DNS TCP"
+  }
+  ingress {
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "DNS UDP"
+  }
+  ingress {
+    from_port   = 88
+    to_port     = 88
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "Kerberos"
+  }
+  ingress {
+    from_port   = 389
+    to_port     = 389
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "LDAP"
+  }
+  ingress {
+    from_port   = 445
+    to_port     = 445
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "SMB"
+  }
+  ingress {
+    from_port   = 636
+    to_port     = 636
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "LDAPS"
+  }
+
+  # HTTP from ALB (health checks + traffic forwarding)
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+    description     = "HTTP from ALB"
+  }
+
+  # All outbound (patching + SSM endpoints)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.project_tag}-windows-asg-sg" }
+}
+
+# ============================================================
+# Windows Server 2019 AMI (latest)
+# ============================================================
+
+data "aws_ami" "windows_2019" {
+  count       = var.custom_ami_id == "" ? 1 : 0
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["Windows_Server-2019-English-Full-Base-*"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ============================================================
+# Launch Template (with IIS userdata)
+# ============================================================
+
+resource "aws_launch_template" "windows" {
+  name_prefix   = "${var.project_tag}-win-"
+  image_id      = local.ami_id
+  instance_type = var.windows_instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_ssm_ad.name
+  }
+
+  vpc_security_group_ids = [aws_security_group.windows_asg.id]
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name          = "${var.project_tag}-win-asg"
+      ADJoin        = "true"
+      PatchGroup    = "Windows-Production"
+      OS            = "Windows Server 2019"
+      "auto-delete" = "no"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = { Name = "${var.project_tag}-win-vol" }
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  user_data = base64encode(<<-EOF
+<powershell>
+Install-WindowsFeature -Name Web-Server -IncludeManagementTools
+</powershell>
+EOF
+  )
+
+  lifecycle { create_before_destroy = true }
+
+  tags = { Name = "${var.project_tag}-win-launch-template" }
+}
+
+# ============================================================
+# Auto Scaling Group
+# ============================================================
+
+resource "aws_autoscaling_group" "windows" {
+  name                      = "${var.project_tag}-windows-asg-2"
+  desired_capacity          = var.asg_desired_capacity
+  min_size                  = var.asg_min_size
+  max_size                  = var.asg_max_size
+  vpc_zone_identifier       = aws_subnet.private[*].id
+  health_check_type         = "EC2"
+  wait_for_capacity_timeout = "15m"
+
+  launch_template {
+    id      = aws_launch_template.windows.id
+    version = "$Latest"
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.project_tag}-win-asg"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "PatchGroup"
+    value               = "Windows-Production"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "ADJoin"
+    value               = "true"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "auto-delete"
+    value               = "no"
+    propagate_at_launch = true
+  }
+
+  depends_on = [
+    aws_directory_service_directory.managed_ad,
+    aws_ssm_association.ad_join,
+    aws_nat_gateway.nat
+  ]
+}
+
+# ============================================================
+# ALB Security Group (allows HTTP/HTTPS from VPC CIDR)
+# ============================================================
+
+resource "aws_security_group" "alb" {
+  name        = "${var.project_tag}-alb-sg"
+  description = "ALB security group - allows HTTP/HTTPS from VPC CIDR"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "HTTP from VPC"
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "HTTPS from VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound"
+  }
+
+  tags = { Name = "${var.project_tag}-alb-sg" }
+}
+
+# ============================================================
+# Application Load Balancer
+# ============================================================
+
+resource "aws_lb" "main" {
+  name               = "${var.project_tag}-alb"
+  internal           = true
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id
+
+  tags = { Name = "${var.project_tag}-alb", "auto-delete" = "no" }
+}
+
+resource "aws_lb_target_group" "windows" {
+  name     = "${var.project_tag}-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = local.vpc_id
+
+  health_check {
+    enabled             = true
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    matcher             = "200-399"
+  }
+
+  tags = { Name = "${var.project_tag}-tg" }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.windows.arn
+  }
+}
+
+# Attach ASG to ALB target group
+resource "aws_autoscaling_attachment" "alb" {
+  autoscaling_group_name = aws_autoscaling_group.windows.name
+  lb_target_group_arn    = aws_lb_target_group.windows.arn
+}
+
+# ============================================================
+# Ubuntu 22.04 AMI (latest)
+# ============================================================
+
+data "aws_ami" "ubuntu_2204" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ============================================================
+# Security Group — Linux Ubuntu Standalone
+# ============================================================
+
+resource "aws_security_group" "linux_ubuntu" {
+  name        = "${var.project_tag}-linux-ubuntu-sg"
+  description = "Linux Ubuntu standalone instance: SSM patching"
+  vpc_id      = local.vpc_id
+
+  # SSH from within VPC only
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.main_cidr_block]
+    description = "SSH from VPC"
+  }
+
+  # HTTP from ALB
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+    description     = "HTTP from ALB"
+  }
+
+  # All outbound (patching + SSM endpoints)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.project_tag}-linux-ubuntu-sg" }
+}
+
+# ============================================================
+# IAM Role — Linux EC2 (SSM only, no AD)
+# ============================================================
+
+resource "aws_iam_role" "ec2_ssm_linux" {
+  name = "${var.project_tag}-ec2-ssm-linux-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+
+  tags = { Name = "${var.project_tag}-ec2-ssm-linux-role" }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core_linux" {
+  role       = aws_iam_role.ec2_ssm_linux.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_ssm_linux" {
+  name = "${var.project_tag}-ec2-ssm-linux-profile"
+  role = aws_iam_role.ec2_ssm_linux.name
+}
+
+# ============================================================
+# Linux Ubuntu Standalone Instance
+# ============================================================
+
+resource "aws_instance" "linux_ubuntu" {
+  ami                    = local.linux_ami_id
+  instance_type          = var.linux_instance_type
+  subnet_id              = aws_subnet.private[0].id
+  vpc_security_group_ids = [aws_security_group.linux_ubuntu.id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_ssm_linux.name
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  tags = {
+    Name          = "${var.project_tag}-linux-ubuntu"
+    PatchGroup    = "Linux-Production"
+    OS            = "Ubuntu 22.04"
+    "auto-delete" = "no"
+  }
+
+  depends_on = [aws_nat_gateway.nat]
+}
+
+# ============================================================
+# SSM Patch Baseline (Ubuntu/Linux)
+# ============================================================
+
+resource "aws_ssm_patch_baseline" "ubuntu" {
+  name             = "${var.project_tag}-ubuntu-baseline"
+  operating_system = "UBUNTU"
+
+  approval_rule {
+    approve_after_days = 7
+    compliance_level   = "CRITICAL"
+
+    patch_filter {
+      key    = "PRIORITY"
+      values = ["Required", "Important"]
+    }
+  }
+
+  approval_rule {
+    approve_after_days = 14
+    compliance_level   = "HIGH"
+
+    patch_filter {
+      key    = "PRIORITY"
+      values = ["Standard", "Optional"]
+    }
+  }
+
+  tags = { Name = "${var.project_tag}-ubuntu-patch-baseline" }
+}
+
+resource "aws_ssm_patch_group" "ubuntu" {
+  baseline_id = aws_ssm_patch_baseline.ubuntu.id
+  patch_group = "Linux-Production"
+}
+
+# ============================================================
+# SSM Maintenance Window Target — Linux
+# ============================================================
+
+resource "aws_ssm_maintenance_window_target" "patch_linux" {
+  window_id     = aws_ssm_maintenance_window.patch.id
+  name          = "${var.project_tag}-patch-targets-linux"
+  resource_type = "INSTANCE"
+
+  targets {
+    key    = "tag:PatchGroup"
+    values = ["Linux-Production"]
+  }
+}
+
+resource "aws_ssm_maintenance_window_task" "patch_linux" {
+  window_id       = aws_ssm_maintenance_window.patch.id
+  name            = "${var.project_tag}-run-patch-baseline-linux"
+  task_type       = "RUN_COMMAND"
+  task_arn        = "AWS-RunPatchBaseline"
+  priority        = 2
+  max_concurrency = "50%"
+  max_errors      = "25%"
+
+  targets {
+    key    = "WindowTargetIds"
+    values = [aws_ssm_maintenance_window_target.patch_linux.id]
+  }
+
+  task_invocation_parameters {
+    run_command_parameters {
+      timeout_seconds = 3600
+
+      parameter {
+        name   = "Operation"
+        values = ["Install"]
+      }
+      parameter {
+        name   = "RebootOption"
+        values = ["RebootIfNeeded"]
+      }
+    }
+  }
+}
+
+# ============================================================
+# SSM Patch Baseline (Windows)
+# ============================================================
+
+resource "aws_ssm_patch_baseline" "windows" {
+  name             = "${var.project_tag}-windows-baseline"
+  operating_system = "WINDOWS"
+
+  approval_rule {
+    approve_after_days = 7
+    compliance_level   = "CRITICAL"
+
+    patch_filter {
+      key    = "CLASSIFICATION"
+      values = ["CriticalUpdates", "SecurityUpdates"]
+    }
+    patch_filter {
+      key    = "MSRC_SEVERITY"
+      values = ["Critical", "Important"]
+    }
+  }
+
+  approval_rule {
+    approve_after_days = 14
+    compliance_level   = "HIGH"
+
+    patch_filter {
+      key    = "CLASSIFICATION"
+      values = ["UpdateRollups", "Updates"]
+    }
+  }
+
+  tags = { Name = "${var.project_tag}-windows-patch-baseline" }
+}
+
+resource "aws_ssm_patch_group" "windows" {
+  baseline_id = aws_ssm_patch_baseline.windows.id
+  patch_group = "Windows-Production"
+}
+
+# ============================================================
+# SSM Maintenance Window + Task
+# ============================================================
+
+resource "aws_ssm_maintenance_window" "patch" {
+  name                       = "${var.project_tag}-patch-window"
+  schedule                   = var.patch_schedule
+  duration                   = var.patch_window_duration
+  cutoff                     = var.patch_window_cutoff
+  allow_unassociated_targets = false
+  tags                       = { Name = "${var.project_tag}-patch-window" }
+}
+
+resource "aws_ssm_maintenance_window_target" "patch" {
+  window_id     = aws_ssm_maintenance_window.patch.id
+  name          = "${var.project_tag}-patch-targets"
+  resource_type = "INSTANCE"
+
+  targets {
+    key    = "tag:PatchGroup"
+    values = ["Windows-Production"]
+  }
+}
+
+resource "aws_ssm_maintenance_window_task" "patch" {
+  window_id       = aws_ssm_maintenance_window.patch.id
+  name            = "${var.project_tag}-run-patch-baseline"
+  task_type       = "RUN_COMMAND"
+  task_arn        = "AWS-RunPatchBaseline"
+  priority        = 1
+  max_concurrency = "50%"
+  max_errors      = "25%"
+
+  targets {
+    key    = "WindowTargetIds"
+    values = [aws_ssm_maintenance_window_target.patch.id]
+  }
+
+  task_invocation_parameters {
+    run_command_parameters {
+      timeout_seconds = 3600
+
+      parameter {
+        name   = "Operation"
+        values = ["Install"]
+      }
+      parameter {
+        name   = "RebootOption"
+        values = ["RebootIfNeeded"]
+      }
+    }
+  }
+}
+
+# ============================================================
+# Outputs
+# ============================================================
+
+output "vpc_id" {
+  description = "VPC ID"
+  value       = local.vpc_id
+}
+
+output "managed_ad_id" {
+  description = "Managed AD directory ID"
+  value       = aws_directory_service_directory.managed_ad.id
+}
+
+output "managed_ad_dns_ips" {
+  description = "Managed AD DNS IPs"
+  value       = aws_directory_service_directory.managed_ad.dns_ip_addresses
+}
+
+output "asg_name" {
+  description = "Windows ASG name"
+  value       = aws_autoscaling_group.windows.name
+}
+
+output "patch_baseline_id" {
+  description = "SSM Patch Baseline ID"
+  value       = aws_ssm_patch_baseline.windows.id
+}
+
+output "maintenance_window_id" {
+  description = "SSM Maintenance Window ID"
+  value       = aws_ssm_maintenance_window.patch.id
+}
+
+output "ami_id" {
+  description = "AMI ID used by the launch template"
+  value       = local.ami_id
+}
+
+output "alb_dns_name" {
+  description = "ALB DNS name"
+  value       = aws_lb.main.dns_name
+}
+
+output "alb_arn" {
+  description = "ALB ARN"
+  value       = aws_lb.main.arn
+}
+
+output "alb_target_group_arn" {
+  description = "ALB Target Group ARN"
+  value       = aws_lb_target_group.windows.arn
+}
+
+output "linux_ubuntu_instance_id" {
+  description = "Linux Ubuntu standalone instance ID"
+  value       = aws_instance.linux_ubuntu.id
+}
+
+output "linux_ubuntu_private_ip" {
+  description = "Linux Ubuntu private IP"
+  value       = aws_instance.linux_ubuntu.private_ip
+}
+
+output "ubuntu_patch_baseline_id" {
+  description = "SSM Patch Baseline ID (Ubuntu)"
+  value       = aws_ssm_patch_baseline.ubuntu.id
+}

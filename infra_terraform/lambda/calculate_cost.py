@@ -4,7 +4,14 @@ import json
 def lambda_handler(event, context):
     """Calculate cost per unit (price per square meter/foot)."""
     try:
-        body = event if isinstance(event, dict) else json.loads(event.get("body", "{}"))
+        # API Gateway Lambda Proxy sends the request body as a JSON string in event["body"]
+        if "body" in event and isinstance(event.get("body"), str):
+            body = json.loads(event["body"])
+        elif "body" in event and isinstance(event.get("body"), dict):
+            body = event["body"]
+        else:
+            # Direct invocation (e.g., test event passed as top-level dict)
+            body = event
 
         price = float(body["price"])
         size = float(body["size"])

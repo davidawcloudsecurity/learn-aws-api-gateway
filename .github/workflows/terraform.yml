@@ -57,8 +57,7 @@ jobs:
           echo "Checking existing resources..."
           LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
           echo $LAMBDA_ROLE_NAME
-          echo ${LAMBDA_ROLE_NAME}
-          echo $(LAMBDA_ROLE_NAME)
+          echo "Test: ${LAMBDA_ROLE_NAME}"
           if aws iam get-role --role-name $LAMBDA_ROLE_NAME >/dev/null 2>&1; then
               echo "Role exists - will use existing"
               terraform apply --auto-approve -var="use_existing_iam=true"

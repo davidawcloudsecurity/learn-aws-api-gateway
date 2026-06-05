@@ -55,7 +55,10 @@ jobs:
           terraform validate
           terraform plan
           echo "Checking existing resources..."
-          if aws iam get-role --role-name learn-tf-aws-vpc-ssm-role >/dev/null 2>&1; then
+          LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
+          echo $LAMBDA_ROLE_NAME
+          echo "Test: ${LAMBDA_ROLE_NAME}"
+          if aws iam get-role --role-name $LAMBDA_ROLE_NAME >/dev/null 2>&1; then
               echo "Role exists - will use existing"
               terraform apply --auto-approve -var="use_existing_iam=true"
           else
@@ -100,9 +103,10 @@ jobs:
         run: |
           terraform destroy -auto-approve -input=false
           echo "Check if learn-tf-aws-vpc-ssm-role exists"
-          if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep learn-tf-aws-vpc-ssm-role | sed 's/[",]//g')" ]; then
-              ROLE_NAME="learn-tf-aws-vpc-ssm-role"
-              INSTANCE_PROFILE_NAME="learn-tf-aws-vpc-ssm-profile"
+          ROLE_NAME="learn-tf-aws-vpc-ssm-role"
+          LAMBDA_ROLE_NAME="learn-api-gateway-lambda-role"
+          INSTANCE_PROFILE_NAME="learn-tf-aws-vpc-ssm-profile"          
+          if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep $ROLE_NAME | sed 's/[",]//g')" ]; then
               
               echo "Removing role from instance profile first..."
               # Remove role from instance profile
@@ -129,7 +133,12 @@ jobs:
               aws iam delete-role --role-name "$ROLE_NAME"
               echo "Role deleted successfully"
           else
-              echo "Role learn-tf-aws-vpc-ssm-role does not exist"
+              echo "Role $ROLE_NAME does not exist"
+          fi
+          if [ -n "$(aws iam list-roles --query 'Roles[*].RoleName' | grep $LAMBDA_ROLE_NAME | sed 's/[",]//g')" ]; then
+              echo "Deleting role: $LAMBDA_ROLE_NAME"
+              aws iam delete-role --role-name "$LAMBDA_ROLE_NAME"
+              echo "Role deleted successfully"
           fi
           echo "Check if learn-tf-aws-vpc-ssm-profile exist"
           if [ -n "$(aws iam list-instance-profiles --query InstanceProfiles[*].InstanceProfileName | grep learn-tf-aws-vpc-ssm-profile | sed 's/[",]//g')" ]; then

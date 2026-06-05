@@ -88,3 +88,4 @@ For immutable patching (golden AMI refresh), you would:
 1. Patch a source AMI using SSM Automation
 2. Update the Launch Template AMI ID
 3. Trigger an ASG instance refresh
+
